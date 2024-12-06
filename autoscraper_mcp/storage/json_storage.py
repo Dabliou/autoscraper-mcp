@@ -1,8 +1,8 @@
 import json
-from typing import Any, Dict, List, Optional
+import os
 from pathlib import Path
+from typing import Any, Dict, List
 import aiofiles
-import ijson
 
 from .base import StorageBackend
 
@@ -56,41 +56,17 @@ class JSONStorage(StorageBackend):
             path: Path to JSON file
             **kwargs: Additional parameters including:
                      - encoding: File encoding (default: utf-8)
-                     - chunk_size: Size of chunks for large files (default: 8192)
-            
+                     
         Returns:
             List of dictionaries with loaded data
         """
         async def _load():
             path_obj = self._validate_path(path)
             encoding = kwargs.get('encoding', 'utf-8')
-            chunk_size = kwargs.get('chunk_size', 8192)
             
-            # Use ijson for streaming large files
-            if path_obj.stat().st_size > 10 * 1024 * 1024:  # 10MB
-                self.logger.info('Large file detected, using streaming parser')
-                async with aiofiles.open(path_obj, mode='rb') as f:
-                    content = await f.read()
-                    parser = ijson.parse(content)
-                    data = []
-                    current_item = None
-                    
-                    for prefix, event, value in parser:
-                        if prefix == 'item' and event == 'start_map':
-                            current_item = {}
-                        elif prefix.startswith('item.') and current_item is not None:
-                            key = prefix.split('.')[1]
-                            current_item[key] = value
-                        elif prefix == 'item' and event == 'end_map':
-                            data.append(current_item)
-                            current_item = None
-                    
-                    return data
-            else:
-                # Regular loading for smaller files
-                async with aiofiles.open(path_obj, encoding=encoding) as f:
-                    content = await f.read()
-                    return json.loads(content)
+            async with aiofiles.open(path_obj, mode='r', encoding=encoding) as f:
+                content = await f.read()
+                return json.loads(content)
 
         return await self._handle_operation('load from JSON', _load)
 
@@ -109,7 +85,6 @@ class JSONStorage(StorageBackend):
 
         async def _append():
             path_obj = self._validate_path(path)
-            encoding = kwargs.get('encoding', 'utf-8')
             
             if not path_obj.exists():
                 # If file doesn't exist, just save
