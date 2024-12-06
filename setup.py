@@ -1,30 +1,23 @@
-from codecs import open
-from os import path
-
-from setuptools import find_packages, setup
-
-here = path.abspath(path.dirname(__file__))
-
-with open(path.join(here, "README.md"), encoding="utf-8") as f:
-    long_description = f.read()
+from setuptools import setup, find_packages
 
 setup(
-    name="autoscraper",
-    version="1.1.14",
-    description="A Smart, Automatic, Fast and Lightweight Web Scraper for Python",
-    long_description_content_type="text/markdown",
-    long_description=long_description,
-    url="https://github.com/alirezamika/autoscraper",
-    author="Alireza Mika",
-    author_email="alirezamika@gmail.com",
-    license="MIT",
-    classifiers=[
-        "Development Status :: 4 - Beta",
-        "License :: OSI Approved :: MIT License",
-        "Programming Language :: Python :: 3",
+    name='autoscraper-mcp',
+    version='0.1.0',
+    description='MCP server for AutoScraper with browser automation integration',
+    author='Your Name',
+    packages=find_packages(),
+    install_requires=[
+        'anthropic-mcp',
+        'autoscraper',
+        'playwright',
+        'sqlalchemy',
+        'pandas',
+        'aiohttp',
+        'pyyaml'
     ],
-    keywords="scraping - scraper",
-    packages=find_packages(exclude=["contrib", "docs", "tests"]),
-    python_requires=">=3.6",
-    install_requires=["requests", "bs4", "lxml"],
+    entry_points={
+        'console_scripts': [
+            'autoscraper-mcp=autoscraper_mcp.server:main',
+        ],
+    },
 )
