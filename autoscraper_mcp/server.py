@@ -2,7 +2,7 @@ import os
 import logging
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Union
 
 from anthropic_mcp import (
     Server,
@@ -14,6 +14,8 @@ from anthropic_mcp import (
 )
 from autoscraper import AutoScraper
 from playwright.async_api import async_playwright
+
+from .storage import SQLiteStorage, CSVStorage, JSONStorage
 
 # Configure logging
 log_dir = Path('/Users/wbiaz/claude/logs/autoscraper-mcp')
@@ -27,10 +29,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class AutoScraperServer(Server):
+    """MCP server for AutoScraper with integrated storage support."""
+
     def __init__(self):
         super().__init__()
         self.scraper = AutoScraper()
-        self.storage_backends = {}
+        self.storage_backends = {
+            'sqlite': SQLiteStorage(),
+            'csv': CSVStorage(),
+            'json': JSONStorage()
+        }
         self.current_browser = None
         logger.info('AutoScraperServer initialized')
 
@@ -44,96 +52,196 @@ class AutoScraperServer(Server):
                     'type': 'object',
                     'properties': {
                         'url': {'type': 'string', 'description': 'Target webpage URL'},
-                        'wanted_data': {'type': 'array', 'description': 'Example data to train scraper with'},
-                        'screenshot': {'type': 'boolean', 'description': 'Take screenshot of page'}
+                        'wanted_data': {
+                            'type': 'array',
+                            'description': 'Example data to train scraper with',
+                            'items': {'type': 'string'}
+                        },
+                        'screenshot': {
+                            'type': 'boolean',
+                            'description': 'Take screenshot of page',
+                            'default': False
+                        }
                     },
                     'required': ['url', 'wanted_data']
                 }
             ),
             Tool(
                 name='scrape_data',
-                description='Scrape data using trained model',
+                description='Scrape data using trained model and store results',
                 inputSchema={
-                    'type': 'object', 
+                    'type': 'object',
                     'properties': {
-                        'url': {'type': 'string'},
-                        'storage_type': {'type': 'string', 'enum': ['sqlite', 'json', 'csv']},
-                        'storage_path': {'type': 'string'}
+                        'url': {'type': 'string', 'description': 'Target webpage URL'},
+                        'storage': {
+                            'type': 'object',
+                            'properties': {
+                                'type': {
+                                    'type': 'string',
+                                    'enum': ['sqlite', 'csv', 'json'],
+                                    'description': 'Storage backend type'
+                                },
+                                'path': {
+                                    'type': 'string',
+                                    'description': 'Path to store the data'
+                                },
+                                'table_name': {
+                                    'type': 'string',
+                                    'description': 'Table name for SQLite storage',
+                                    'default': 'scraped_data'
+                                },
+                                'encoding': {
+                                    'type': 'string',
+                                    'description': 'File encoding for CSV/JSON',
+                                    'default': 'utf-8'
+                                },
+                                'append': {
+                                    'type': 'boolean',
+                                    'description': 'Append to existing data',
+                                    'default': False
+                                }
+                            },
+                            'required': ['type', 'path']
+                        }
                     },
-                    'required': ['url']
+                    'required': ['url', 'storage']
+                }
+            ),
+            Tool(
+                name='save_scraper',
+                description='Save trained scraper model',
+                inputSchema={
+                    'type': 'object',
+                    'properties': {
+                        'path': {'type': 'string', 'description': 'Path to save model'}
+                    },
+                    'required': ['path']
+                }
+            ),
+            Tool(
+                name='load_scraper',
+                description='Load trained scraper model',
+                inputSchema={
+                    'type': 'object',
+                    'properties': {
+                        'path': {'type': 'string', 'description': 'Path to load model from'}
+                    },
+                    'required': ['path']
                 }
             )
         ])
+
+    async def _get_page_content(self, url: str, screenshot: bool = False) -> tuple[str, Optional[str]]:
+        """Get page content using Playwright.
+        
+        Args:
+            url: Target webpage URL
+            screenshot: Whether to take a screenshot
+            
+        Returns:
+            Tuple of (html_content, screenshot_path)
+        """
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            page = await browser.new_page()
+            await page.goto(url)
+
+            screenshot_path = None
+            if screenshot:
+                screenshot_path = str(log_dir / f'screenshot_{hash(url)}.png')
+                await page.screenshot(path=screenshot_path)
+
+            html_content = await page.content()
+            await browser.close()
+            
+            return html_content, screenshot_path
+
+    async def _store_data(self, data: List[Dict], storage_config: Dict) -> Dict[str, Any]:
+        """Store scraped data using specified backend.
+        
+        Args:
+            data: Scraped data to store
+            storage_config: Storage configuration
+            
+        Returns:
+            Dictionary with storage results
+        """
+        storage_type = storage_config['type']
+        if storage_type not in self.storage_backends:
+            raise ValueError(f'Unsupported storage type: {storage_type}')
+
+        backend = self.storage_backends[storage_type]
+        path = storage_config['path']
+        
+        if storage_config.get('append', False):
+            await backend.append(data, path, **storage_config)
+        else:
+            await backend.save(data, path, **storage_config)
+
+        return {
+            'storage_type': storage_type,
+            'storage_path': path,
+            'record_count': len(data)
+        }
 
     async def call_tool(self, request: ToolCallRequestSchema) -> ToolCallResponseSchema:
         """Handle tool calls for AutoScraper operations."""
         try:
             if request.tool_name == 'init_scraper':
-                result = await self._init_scraper(request.tool_input)
+                url = request.tool_input['url']
+                wanted_data = request.tool_input['wanted_data']
+                screenshot = request.tool_input.get('screenshot', False)
+
+                html_content, screenshot_path = await self._get_page_content(url, screenshot)
+                result = self.scraper.build(html=html_content, wanted_list=wanted_data)
+
+                return ToolCallResponseSchema(tool_output={
+                    'training_result': result,
+                    'screenshot_path': screenshot_path
+                })
+
             elif request.tool_name == 'scrape_data':
-                result = await self._scrape_data(request.tool_input)
+                url = request.tool_input['url']
+                storage_config = request.tool_input['storage']
+
+                html_content, _ = await self._get_page_content(url)
+                scraped_data = self.scraper.get_result_similar(html=html_content)
+                
+                if not isinstance(scraped_data, list):
+                    scraped_data = [scraped_data]
+                
+                # Convert to list of dicts if necessary
+                if scraped_data and not isinstance(scraped_data[0], dict):
+                    scraped_data = [{'value': item} for item in scraped_data]
+
+                storage_result = await self._store_data(scraped_data, storage_config)
+
+                return ToolCallResponseSchema(tool_output={
+                    'scraped_data': scraped_data[:5],  # Preview first 5 items
+                    'total_items': len(scraped_data),
+                    'storage': storage_result
+                })
+
+            elif request.tool_name == 'save_scraper':
+                path = request.tool_input['path']
+                self.scraper.save(path)
+                return ToolCallResponseSchema(tool_output={
+                    'message': f'Scraper model saved to {path}'
+                })
+
+            elif request.tool_name == 'load_scraper':
+                path = request.tool_input['path']
+                self.scraper.load(path)
+                return ToolCallResponseSchema(tool_output={
+                    'message': f'Scraper model loaded from {path}'
+                })
+
             else:
                 raise ValueError(f'Unknown tool: {request.tool_name}')
-            
-            return ToolCallResponseSchema(tool_output=result)
+
         except Exception as e:
             logger.error(f'Error in tool {request.tool_name}: {str(e)}')
             raise
-
-    async def _init_scraper(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Initialize and train the AutoScraper."""
-        url = input_data['url']
-        wanted_data = input_data['wanted_data']
-        take_screenshot = input_data.get('screenshot', False)
-
-        async with async_playwright() as p:
-            browser = await p.chromium.launch()
-            page = await browser.new_page()
-            await page.goto(url)
-
-            if take_screenshot:
-                screenshot_path = log_dir / f'screenshot_{hash(url)}.png'
-                await page.screenshot(path=str(screenshot_path))
-
-            html_content = await page.content()
-            await browser.close()
-
-        result = self.scraper.build(html=html_content, wanted_list=wanted_data)
-        return {
-            'training_result': result,
-            'screenshot_path': str(screenshot_path) if take_screenshot else None
-        }
-
-    async def _scrape_data(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute scraping using trained model."""
-        url = input_data['url']
-        storage_type = input_data.get('storage_type', 'json')
-        storage_path = input_data.get('storage_path')
-
-        async with async_playwright() as p:
-            browser = await p.chromium.launch()
-            page = await browser.new_page()
-            await page.goto(url)
-            html_content = await page.content()
-            await browser.close()
-
-        result = self.scraper.get_result_similar(html=html_content)
-
-        if storage_path:
-            if storage_type == 'sqlite':
-                # TODO: Implement SQLite storage
-                pass
-            elif storage_type == 'csv':
-                # TODO: Implement CSV storage
-                pass
-            elif storage_type == 'json':
-                with open(storage_path, 'w') as f:
-                    json.dump(result, f)
-
-        return {
-            'scraped_data': result,
-            'storage_path': storage_path
-        }
 
 def main():
     """Entry point for the AutoScraper MCP server."""
